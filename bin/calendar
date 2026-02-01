@@ -1,18 +1,51 @@
-#!/bin/bash
-# Wrapper to run gcal_cli.py easily checking for venv
+#!/usr/bin/env bash
+# Robust wrapper: auto-detect repository gcal_cli.py and per-project venv
 
-if [ -f "/home/notadil/Desktop/.venv/bin/python" ]; then
-    PYTHON_CMD="/home/notadil/Desktop/.venv/bin/python"
+set -euo pipefail
+
+# If user set GCAL_SCRIPT explicitly, prefer it
+if [ -n "${GCAL_SCRIPT:-}" ]; then
+    SCRIPT_PATH="$GCAL_SCRIPT"
 else
-    PYTHON_CMD="python3"
+    # Search upwards from current directory for src/gcal_cli.py
+    SEARCH_DIR="$PWD"
+    SCRIPT_PATH=""
+    while [ "$SEARCH_DIR" != "/" ]; do
+        if [ -f "$SEARCH_DIR/src/gcal_cli.py" ]; then
+            SCRIPT_PATH="$SEARCH_DIR/src/gcal_cli.py"
+            PROJECT_ROOT="$SEARCH_DIR"
+            break
+        fi
+        SEARCH_DIR=$(dirname "$SEARCH_DIR")
+    done
+
+    # Fallbacks: known locations
+    if [ -z "${SCRIPT_PATH}" ]; then
+        if [ -f "$HOME/Desktop/src/gcal_cli.py" ]; then
+            SCRIPT_PATH="$HOME/Desktop/src/gcal_cli.py"
+            PROJECT_ROOT="$HOME/Desktop"
+        elif [ -f "$HOME/Desktop/gcal_cli.py" ]; then
+            SCRIPT_PATH="$HOME/Desktop/gcal_cli.py"
+            PROJECT_ROOT="$HOME/Desktop"
+        fi
+    fi
+
+    if [ -z "${SCRIPT_PATH}" ]; then
+        echo "Error: could not find gcal_cli.py (set GCAL_SCRIPT env to override)" >&2
+        exit 2
+    fi
 fi
 
-GCAL_SCRIPT="/home/notadil/Desktop/gcal_cli.py"
+# Determine python: prefer project .venv, then system python3
+PYTHON_CMD="python3"
+if [ -n "${PROJECT_ROOT:-}" ] && [ -x "$PROJECT_ROOT/.venv/bin/python" ]; then
+    PYTHON_CMD="$PROJECT_ROOT/.venv/bin/python"
+elif [ -x "$HOME/.venv/bin/python" ]; then
+    PYTHON_CMD="$HOME/.venv/bin/python"
+fi
 
 if [ $# -eq 0 ]; then
-    # No args? Run help
-    $PYTHON_CMD "$GCAL_SCRIPT" -h
+    exec "$PYTHON_CMD" "$SCRIPT_PATH" -h
 else
-    # Pass args along
-    $PYTHON_CMD "$GCAL_SCRIPT" "$@"
+    exec "$PYTHON_CMD" "$SCRIPT_PATH" "$@"
 fi
