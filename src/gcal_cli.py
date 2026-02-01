@@ -80,16 +80,49 @@ class C:
     DIM = '\033[2m'
     END = '\033[0m'
 
-def setup_logging(quiet=False):
+def setup_logging(quiet=False, level_name: str = 'INFO', log_file: str | None = None):
+    """Configure logging:
+    - Rotating file handler (5MB, 5 backups) written to `logs/` unless `log_file` given
+    - Console handler (unless quiet)
+    - Returns path to used log file
+    """
     LOG_DIR.mkdir(exist_ok=True)
-    fn = LOG_DIR / f'gcal_cli_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log'
-    handlers = [logging.FileHandler(fn, encoding='utf-8')]
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    default_log = LOG_DIR / f'gcal_cli_{ts}.log'
+
+    if log_file:
+        log_path = Path(log_file)
+    else:
+        log_path = default_log
+
+    # Resolve numeric level
+    level = getattr(logging, level_name.upper(), logging.INFO)
+
+    # Create handlers
+    file_handler = logging.handlers.RotatingFileHandler(
+        filename=str(log_path), maxBytes=5 * 1024 * 1024, backupCount=5, encoding='utf-8'
+    )
+    console_handler = logging.StreamHandler(sys.stdout)
+
+    # Formatters
+    file_fmt = logging.Formatter('%(asctime)s %(levelname)s %(name)s %(message)s')
+    console_fmt = logging.Formatter('%(levelname)s: %(message)s')
+
+    file_handler.setFormatter(file_fmt)
+    console_handler.setFormatter(console_fmt)
+
+    root = logging.getLogger()
+    # Remove existing handlers to avoid duplication
+    for h in list(root.handlers):
+        root.removeHandler(h)
+
+    root.setLevel(level)
+    root.addHandler(file_handler)
     if not quiet:
-        # We handle stdout manually with print to avoid double logging if desired, 
-        # but for simplicity let's rely on manual print() for user feedback and logging for file.
-        pass
-    logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s', handlers=handlers)
-    return fn
+        root.addHandler(console_handler)
+
+    logging.getLogger(__name__).debug('Logging initialized: level=%s file=%s', level_name, log_path)
+    return str(log_path)
 
 def ok(msg): print(f"{C.GREEN}✓{C.END} {msg}")
 def warn(msg): print(f"{C.YELLOW}⚠{C.END} {msg}")
@@ -476,6 +509,9 @@ def cmd_extract(args):
 # ══════════════════════════════════════════════════════════════════════════════
 def main():
     parser = argparse.ArgumentParser(prog='gcal_cli', description='Google Calendar CLI Tool')
+    # Global options
+    parser.add_argument('--log-level', default='INFO', choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'], help='Logging level')
+    parser.add_argument('--log-file', default=None, help='Optional log file path')
     sub = parser.add_subparsers(dest='cmd')
     
     # Audit
@@ -510,8 +546,9 @@ def main():
     p_ext.add_argument('--pdf', default=DEFAULT_PDF)
     
     args = parser.parse_args()
-    
-    setup_logging()
+
+    # Initialize logging with requested level/file
+    setup_logging(quiet=False, level_name=args.log_level, log_file=args.log_file)
     
     if args.cmd == 'audit': cmd_audit(args)
     elif args.cmd == 'check': cmd_audit(args) # check -> audit

@@ -49,3 +49,9 @@ Open an issue or submit a PR. For quick tasks I can help prepare branches or CI.
 
 ---
 Commit notes: improved README with usage and layout.
+
+## Additional features added
+
+- Improved logging: uses a rotating log file under `logs/` and a console output with adjustable `--log-level` and `--log-file` flags.
+- CI: a lightweight GitHub Actions workflow runs syntax checks and a smoke test on push/PR (`.github/workflows/ci.yml`).
+- Shell completion: `docs/calendar-completion.sh` provides a small bash completion helper - source it from your shell or copy to `/etc/bash_completion.d/`.
