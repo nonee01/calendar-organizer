@@ -1,0 +1,21 @@
+# Virtual env
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# Artifacts and intermediate data
+artifacts/
+data/
+upload_*.csv
+upload_*.ics
+logs/
+*.log
+
+# Credentials
+credentials.json
+token.json
+client_secret_*.json
+
+# OS
+.DS_Store

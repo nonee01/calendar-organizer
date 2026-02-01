@@ -1,0 +1,18 @@
+#!/bin/bash
+# Wrapper to run gcal_cli.py easily checking for venv
+
+if [ -f "/home/notadil/Desktop/.venv/bin/python" ]; then
+    PYTHON_CMD="/home/notadil/Desktop/.venv/bin/python"
+else
+    PYTHON_CMD="python3"
+fi
+
+GCAL_SCRIPT="/home/notadil/Desktop/gcal_cli.py"
+
+if [ $# -eq 0 ]; then
+    # No args? Run help
+    $PYTHON_CMD "$GCAL_SCRIPT" -h
+else
+    # Pass args along
+    $PYTHON_CMD "$GCAL_SCRIPT" "$@"
+fi
