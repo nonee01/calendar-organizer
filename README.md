@@ -1,57 +1,38 @@
 # Calendar
 
-A small CLI to extract a course schedule from a PDF, normalize it to CSV, and upload per-course calendars to Google Calendar.
+Scripts I use to get the Sec6 timetable into Google Calendar without
+entering three hundred events by hand.
 
-## Quickstart
+The flow is: the schedule starts as a CSV, the script checks it for
+mistakes, assigns a colour per course, and then uploads it.
 
-1. Create and activate a virtual environment (recommended):
+## What it checks
 
-	```bash
-	python -m venv .venv
-	source .venv/bin/activate
-	pip install -r requirements.txt
-	```
+- dates and times parse
+- weeks are inside S14 to S26
+- no duplicate events
+- no missing fields
 
-2. Place your Google OAuth credentials at `credentials.json` (not checked into the repo).
+Errors come back with the row number so you can go fix the CSV.
 
-3. Run the CLI via the `calendar` wrapper or directly:
+## Colours
 
-	```bash
-	# show help
-	calendar -h
+Courses get one of the 11 Google Calendar colours based on the course name.
+The matching is loose on purpose because the course names in the CSV have
+typos and inconsistent accents. The mapping is at the top of the script if
+you want to change it.
 
-	# audit the CSV
-	calendar audit --csv google_s4_fixed.csv
+## Requirements
 
-	# extract from PDF (delegates to `final_extractor.py`)
-	calendar extract --pdf "Emploi du temps 2AS4 Cr-TD SP 2025-2026.pdf"
+Python 3.10 or newer, and Google Calendar API credentials (OAuth, the
+first run opens a browser).
 
-	# sync missing calendars (safe, retries on quota)
-	calendar sync --csv google_s4_fixed.csv --pause 300
-	```
+    pip install -r requirements.txt
 
-## Files / Layout
+## Usage
 
-- `bin/calendar` - executable wrapper to run the CLI.
-- `src/gcal_cli.py` - main consolidated CLI implementation.
-- `src/final_extractor.py` - timetable PDF extractor (produces `optimized_schedule.csv`).
-- `data/` - canonical CSV files and produced CSVs.
-- `artifacts/` - archived logs and intermediate files (ignored by git).
+    python calendar_organizer.py
 
-## Credentials & Safety
-
-- Do NOT commit `credentials.json` or `token.json`. They are ignored by `.gitignore` and moved to `artifacts/` during cleanup.
-- If Google API quota errors occur, use `calendar sync` with longer `--pause` values or retry later.
-
-## Contributing
-
-Open an issue or submit a PR. For quick tasks I can help prepare branches or CI.
-
----
-Commit notes: improved README with usage and layout.
-
-## Additional features added
-
-- Improved logging: uses a rotating log file under `logs/` and a console output with adjustable `--log-level` and `--log-file` flags.
-- CI: a lightweight GitHub Actions workflow runs syntax checks and a smoke test on push/PR (`.github/workflows/ci.yml`).
-- Shell completion: `docs/calendar-completion.sh` provides a small bash completion helper - source it from your shell or copy to `/etc/bash_completion.d/`.
+It makes a backup of the CSV before touching anything. There is also an ICS
+export if you would rather import the file yourself, and a stats mode that
+prints how many events per week and per course.

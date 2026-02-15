@@ -31,10 +31,33 @@ import re
 import time
 import json
 import shutil
+import os
 from pathlib import Path
 from datetime import datetime, timedelta
 from collections import defaultdict
 from zoneinfo import ZoneInfo
+
+# Optional DB + progress
+try:
+    from sqlalchemy import create_engine, MetaData, Table, Column, String, Integer, DateTime, Boolean, UniqueConstraint, select
+    from sqlalchemy.exc import IntegrityError
+except Exception:
+    create_engine = None
+    MetaData = None
+    Table = None
+    Column = None
+    String = None
+    Integer = None
+    DateTime = None
+    Boolean = None
+    UniqueConstraint = None
+    select = None
+    IntegrityError = Exception
+
+try:
+    from tqdm import tqdm
+except Exception:
+    tqdm = None
 
 # Try imports
 try:
@@ -59,6 +82,7 @@ DEFAULT_CSV = Path('google_s4_fixed.csv')
 DEFAULT_PDF = Path("Emploi du temps 2AS4 Cr-TD SP 2025-2026.pdf")
 TOKEN_PATH = Path('token.json')
 CREDS_PATH = Path('credentials.json')
+ARTIFACT_DIR = Path('artifacts')
 
 EXPECTED_WEEKS = ['S14', 'S15', 'S16', 'S17', 'S18', 'S19', 'S22', 'S23', 'S24', 'S26']
 SESSION_WINDOWS = [
@@ -99,7 +123,12 @@ def setup_logging(quiet=False, level_name: str = 'INFO', log_file: str | None = 
     level = getattr(logging, level_name.upper(), logging.INFO)
 
     # Create handlers
-    file_handler = logging.handlers.RotatingFileHandler(
+    # RotatingFileHandler is in logging.handlers; import if needed
+    try:
+        RotatingFileHandler = logging.handlers.RotatingFileHandler
+    except Exception:
+        from logging.handlers import RotatingFileHandler
+    file_handler = RotatingFileHandler(
         filename=str(log_path), maxBytes=5 * 1024 * 1024, backupCount=5, encoding='utf-8'
     )
     console_handler = logging.StreamHandler(sys.stdout)
@@ -203,6 +232,250 @@ def call_with_retry(label, fn, max_tries=5, base_delay=10):
 # COMMANDS
 # ══════════════════════════════════════════════════════════════════════════════
 
+def ensure_db():
+    if not create_engine:
+        err("SQLAlchemy not installed. Run: pip install sqlalchemy")
+        return None, None, None
+    ARTIFACT_DIR.mkdir(exist_ok=True)
+    db_url = os.getenv('DATABASE_URL')
+    if not db_url:
+        db_url = f"sqlite:///{ARTIFACT_DIR / 'sync_state.db'}"
+    engine = create_engine(db_url, future=True)
+    meta = MetaData()
+    calendars = Table(
+        'calendars', meta,
+        Column('id', Integer, primary_key=True, autoincrement=True),
+        Column('summary', String, unique=True, nullable=False),
+        Column('gcal_id', String, nullable=False),
+        Column('expected_count', Integer, default=0),
+        Column('synced_count', Integer, default=0),
+        Column('complete', Boolean, default=False),
+        Column('last_sync', DateTime, nullable=True),
+    )
+    events = Table(
+        'events', meta,
+        Column('id', Integer, primary_key=True, autoincrement=True),
+        Column('calendar_summary', String, nullable=False),
+        Column('calendar_id', String, nullable=False),
+        Column('event_id', String, nullable=True),
+        Column('summary', String, nullable=False),
+        Column('start', String, nullable=False),
+        Column('end', String, nullable=False),
+        UniqueConstraint('calendar_id', 'summary', 'start', 'end', name='uq_event_sig')
+    )
+    meta.create_all(engine)
+    return engine, calendars, events
+
+class QuotaTracker:
+    def __init__(self, quota_total: int | None):
+        self.quota_total = quota_total
+        self.used = 0
+        self.started = time.time()
+
+    def use(self, n=1):
+        self.used += n
+
+    @property
+    def remaining(self):
+        if self.quota_total is None:
+            return None
+        return max(self.quota_total - self.used, 0)
+
+def make_tqdm(iterable, **kwargs):
+    if tqdm:
+        return tqdm(iterable, **kwargs)
+    return iterable
+
+def db_record_event(engine, events_tbl, cal_summary, cal_id, ev_id, summary, start, end):
+    try:
+        with engine.begin() as conn:
+            conn.execute(events_tbl.insert().values(
+                calendar_summary=cal_summary,
+                calendar_id=cal_id,
+                event_id=ev_id,
+                summary=summary,
+                start=start,
+                end=end
+            ))
+        return True
+    except IntegrityError:
+        return False
+    except Exception as e:
+        warn(f"DB record failed: {e}")
+        return False
+
+def db_count_events(engine, events_tbl, cal_id):
+    with engine.begin() as conn:
+        res = conn.execute(select(events_tbl.c.id).where(events_tbl.c.calendar_id == cal_id))
+        return len(res.fetchall())
+
+def db_existing_sigs(engine, events_tbl, cal_id):
+    with engine.begin() as conn:
+        res = conn.execute(
+            select(events_tbl.c.summary, events_tbl.c.start, events_tbl.c.end)
+            .where(events_tbl.c.calendar_id == cal_id)
+        )
+        return {(r[0], r[1], r[2]) for r in res.fetchall()}
+
+def upsert_calendar(engine, calendars_tbl, summary, gcal_id, expected_count, synced_count, complete):
+    with engine.begin() as conn:
+        existing = conn.execute(
+            calendars_tbl.select().where(calendars_tbl.c.summary == summary)
+        ).fetchone()
+        if existing:
+            conn.execute(
+                calendars_tbl.update().where(calendars_tbl.c.summary == summary).values(
+                    gcal_id=gcal_id,
+                    expected_count=expected_count,
+                    synced_count=synced_count,
+                    complete=complete,
+                    last_sync=datetime.now()
+                )
+            )
+        else:
+            conn.execute(
+                calendars_tbl.insert().values(
+                    summary=summary,
+                    gcal_id=gcal_id,
+                    expected_count=expected_count,
+                    synced_count=synced_count,
+                    complete=complete,
+                    last_sync=datetime.now()
+                )
+            )
+
+def ensure_calendar_exists(service, course_name, quota: QuotaTracker | None = None):
+    cal_id = None
+    token = None
+    while True:
+        resp = service.calendarList().list(pageToken=token).execute()
+        if quota: quota.use(1)
+        for c in resp.get('items', []):
+            if c.get('summary') == course_name:
+                cal_id = c['id']
+                break
+        token = resp.get('nextPageToken')
+        if not token or cal_id:
+            break
+    if cal_id:
+        return cal_id, False
+    info("Creating calendar...")
+    c = call_with_retry(
+        f"create {course_name}",
+        lambda: service.calendars().insert(body={'summary': course_name, 'timeZone': 'Europe/Paris'}).execute()
+    )
+    if quota: quota.use(1)
+    return c['id'], True
+
+def sync_course_with_db(service, course_name, rows, engine, calendars_tbl, events_tbl, quota: QuotaTracker | None = None):
+    # Build expected signatures
+    expected = []
+    min_dt = None
+    max_dt = None
+    for r in rows:
+        s, e, all_day = parse_dt(r)
+        if not s:
+            continue
+        if all_day:
+            start_sig = s.isoformat()
+            end_sig = e.isoformat()
+        else:
+            start_sig = s.isoformat()
+            end_sig = e.isoformat()
+        expected.append((r['Subject'], start_sig, end_sig, r, all_day))
+        if isinstance(s, datetime):
+            min_dt = s if not min_dt or s < min_dt else min_dt
+            max_dt = e if not max_dt or e > max_dt else max_dt
+
+    expected_sigs = {(x[0], x[1], x[2]) for x in expected}
+    expected_count = len(expected_sigs)
+
+    cal_id, created = ensure_calendar_exists(service, course_name, quota)
+    if created:
+        ok("Created calendar")
+    else:
+        info(f"Using existing calendar {cal_id}")
+
+    # Fetch existing events from Google into DB (range = CSV min/max)
+    if min_dt and max_dt:
+        if min_dt.tzinfo is None:
+            min_dt = min_dt.replace(tzinfo=ZoneInfo('Europe/Paris'))
+        if max_dt.tzinfo is None:
+            max_dt = max_dt.replace(tzinfo=ZoneInfo('Europe/Paris'))
+        time_min = min_dt.isoformat()
+        time_max = max_dt.isoformat()
+    else:
+        time_min = datetime.now().isoformat() + 'Z'
+        time_max = (datetime.now() + timedelta(days=180)).isoformat() + 'Z'
+
+    token = None
+    while True:
+        resp = service.events().list(
+            calendarId=cal_id,
+            timeMin=time_min,
+            timeMax=time_max,
+            singleEvents=True,
+            orderBy='startTime',
+            pageToken=token
+        ).execute()
+        if quota: quota.use(1)
+        for ev in resp.get('items', []):
+            summary = ev.get('summary', '')
+            start = ev.get('start', {}).get('dateTime') or ev.get('start', {}).get('date')
+            end = ev.get('end', {}).get('dateTime') or ev.get('end', {}).get('date')
+            db_record_event(engine, events_tbl, course_name, cal_id, ev.get('id'), summary, start, end)
+        token = resp.get('nextPageToken')
+        if not token:
+            break
+
+    existing_sigs = db_existing_sigs(engine, events_tbl, cal_id)
+    if expected_sigs.issubset(existing_sigs):
+        upsert_calendar(engine, calendars_tbl, course_name, cal_id, expected_count, len(existing_sigs), True)
+        ok("Already complete. Skipping.")
+        return
+
+    # Upload missing events
+    missing = [x for x in expected if (x[0], x[1], x[2]) not in existing_sigs]
+    if not missing:
+        upsert_calendar(engine, calendars_tbl, course_name, cal_id, expected_count, len(existing_sigs), True)
+        ok("No missing events")
+        return
+
+    bar = make_tqdm(missing, desc="Uploading", unit="evt", leave=False)
+    inserted = 0
+    for subj, start_sig, end_sig, r, all_day in bar:
+        if all_day:
+            body = {
+                'summary': r['Subject'],
+                'description': r.get('Description', ''),
+                'start': {'date': start_sig},
+                'end': {'date': end_sig}
+            }
+        else:
+            body = {
+                'summary': r['Subject'],
+                'description': r.get('Description', ''),
+                'start': {'dateTime': start_sig, 'timeZone': 'Europe/Paris'},
+                'end': {'dateTime': end_sig, 'timeZone': 'Europe/Paris'}
+            }
+        try:
+            ev = call_with_retry("insert", lambda: service.events().insert(calendarId=cal_id, body=body).execute())
+            if quota: quota.use(1)
+            db_record_event(engine, events_tbl, course_name, cal_id, ev.get('id'), subj, start_sig, end_sig)
+            inserted += 1
+            time.sleep(0.3)
+        except Exception as e:
+            err(f"Failed event: {e}")
+        if tqdm and isinstance(bar, tqdm):
+            bar.set_postfix({
+                'quota_left': quota.remaining if quota else 'n/a',
+                'eta': f"{bar.format_dict.get('remaining', 0):.0f}s" if bar.format_dict else 'n/a'
+            })
+
+    existing_sigs = db_existing_sigs(engine, events_tbl, cal_id)
+    upsert_calendar(engine, calendars_tbl, course_name, cal_id, expected_count, len(existing_sigs), expected_sigs.issubset(existing_sigs))
+    ok(f"Inserted {inserted} events")
+
 def cmd_audit(args):
     """Validate CSV"""
     header(f"AUDIT: {args.csv}")
@@ -302,12 +575,154 @@ def cmd_delete(args):
         except Exception as e:
             err(f"Failed to delete {c.get('summary')}: {e}")
 
+def cmd_prune(args):
+    """Delete all calendars except protected keywords (case-insensitive)"""
+    header("PRUNE CALENDARS")
+    service = get_service()
+    if not service:
+        return
+
+    token = None
+    candidates = []
+    while True:
+        resp = service.calendarList().list(pageToken=token).execute()
+        for c in resp.get('items', []):
+            name = c.get('summary', '')
+            lname = name.lower()
+            if any(k in lname for k in PROTECTED_KEYWORDS):
+                continue
+            candidates.append(c)
+        token = resp.get('nextPageToken')
+        if not token:
+            break
+
+    if not candidates:
+        ok("No calendars to delete")
+        return
+
+    subheader(f"Will delete {len(candidates)} calendars")
+    for c in candidates:
+        print(f"  • {c.get('summary')} ({c.get('id')})")
+
+    if not args.yes:
+        warn("Run with --yes to confirm deletion")
+        return
+
+    for c in candidates:
+        try:
+            service.calendars().delete(calendarId=c['id']).execute()
+            ok(f"Deleted {c.get('summary')}")
+            time.sleep(0.2)
+        except Exception as e:
+            err(f"Failed to delete {c.get('summary')}: {e}")
+
 def cmd_dedupe(args):
-    # Minimal stub if not implemented fully, but user had it.
-    header(f"DEDUPE: {args.pattern if hasattr(args, 'pattern') else 'all'}")
-    # (Implementation omitted for brevity as user didn't explicitly ask for it to be perfect, just better tool. 
-    # But for completeness, let's just warn or implement basic.)
-    warn("Dedupe not fully implemented in this consolidated version yet. Use sync to handle duplicates.")
+    header(f"DEDUPE: {args.pattern if args.pattern else 'all calendars'}")
+    service = get_service()
+    if not service:
+        return
+
+    # Build time window (default: +/- 365 days)
+    now = datetime.now(ZoneInfo('Europe/Paris'))
+    if args.time_min:
+        time_min = datetime.fromisoformat(args.time_min)
+    else:
+        time_min = now - timedelta(days=365)
+    if args.time_max:
+        time_max = datetime.fromisoformat(args.time_max)
+    else:
+        time_max = now + timedelta(days=365)
+
+    time_min_iso = time_min.isoformat()
+    time_max_iso = time_max.isoformat()
+
+    # Find calendars
+    token = None
+    calendars = []
+    while True:
+        resp = service.calendarList().list(pageToken=token).execute()
+        for c in resp.get('items', []):
+            name = c.get('summary', '')
+            if args.pattern and not re.search(args.pattern, name, re.IGNORECASE):
+                continue
+            calendars.append(c)
+        token = resp.get('nextPageToken')
+        if not token:
+            break
+
+    if not calendars:
+        warn("No calendars matched")
+        return
+
+    total_dupes = 0
+    total_deleted = 0
+
+    for cal in calendars:
+        cal_id = cal['id']
+        cal_name = cal.get('summary', cal_id)
+        subheader(f"Scanning: {cal_name}")
+
+        # Fetch events with pagination
+        events = []
+        token = None
+        while True:
+            resp = service.events().list(
+                calendarId=cal_id,
+                timeMin=time_min_iso,
+                timeMax=time_max_iso,
+                singleEvents=True,
+                orderBy='startTime',
+                pageToken=token
+            ).execute()
+            events.extend(resp.get('items', []))
+            token = resp.get('nextPageToken')
+            if not token:
+                break
+
+        if not events:
+            info("No events in range")
+            continue
+
+        # Identify duplicates by summary + start + end
+        seen = {}
+        dupes = []
+        for ev in events:
+            summary = ev.get('summary', '')
+            if any(k in summary.lower() for k in PROTECTED_KEYWORDS):
+                continue
+            start = ev.get('start', {}).get('dateTime') or ev.get('start', {}).get('date')
+            end = ev.get('end', {}).get('dateTime') or ev.get('end', {}).get('date')
+            key = (summary.strip(), start, end)
+            if key in seen:
+                dupes.append(ev)
+            else:
+                seen[key] = ev
+
+        if not dupes:
+            ok("No duplicates found")
+            continue
+
+        total_dupes += len(dupes)
+        info(f"Duplicates found: {len(dupes)}")
+
+        # Delete duplicates
+        for ev in dupes:
+            ev_id = ev.get('id')
+            if not ev_id:
+                continue
+            if args.dry_run:
+                continue
+            try:
+                call_with_retry("delete", lambda: service.events().delete(calendarId=cal_id, eventId=ev_id).execute())
+                total_deleted += 1
+                time.sleep(0.2)
+            except Exception as e:
+                err(f"Failed to delete duplicate: {e}")
+
+    if args.dry_run:
+        ok(f"Dry run complete. Duplicates detected: {total_dupes}")
+    else:
+        ok(f"Deleted {total_deleted} duplicates (detected {total_dupes})")
 
 
 def cmd_upload(args):
@@ -427,53 +842,91 @@ def cmd_sync(args):
     
     service = get_service()
     if not service: return
-    
-    # 2. Identify Missing
-    # We do a fresh list
-    current_map = {}
-    token = None
-    while True:
-        resp = service.calendarList().list(pageToken=token).execute()
-        for c in resp.get('items', []):
-            current_map[c.get('summary')] = c['id']
-        token = resp.get('nextPageToken')
-        if not token: break
-    
-    existing = set(current_map.keys())
-    missing = sorted(desired - existing)
-    
-    info(f"Target courses: {len(desired)}")
-    info(f"Existing calendars: {len(existing)}")
-    
-    if not missing:
-        ok("All calendars present!")
-        return
 
-    subheader(f"Missing Calendars ({len(missing)}):")
-    for m in missing: print(f"  - {m}")
+    engine, calendars_tbl, events_tbl = ensure_db()
+    if not engine:
+        return
     
-    # 3. Loop and Create
-    pause = args.pause
-    for idx, course in enumerate(missing, 1):
+    quota_val = args.quota
+    if quota_val is None:
+        env_q = os.getenv('QUOTA_REMAINING')
+        if env_q:
+            try:
+                quota_val = int(env_q)
+            except Exception:
+                quota_val = None
+    quota = QuotaTracker(quota_val)
+
+    courses = sorted(desired)
+    info(f"Target courses: {len(courses)}")
+
+    if args.delete_existing:
+        subheader("Deleting existing calendars before sync")
+        # Map existing calendars
+        token = None
+        existing = []
+        while True:
+            resp = service.calendarList().list(pageToken=token).execute()
+            if quota: quota.use(1)
+            for c in resp.get('items', []):
+                if c.get('summary') in desired:
+                    existing.append(c)
+            token = resp.get('nextPageToken')
+            if not token:
+                break
+
+        if existing:
+            del_bar = make_tqdm(existing, desc="Deleting", unit="cal", leave=False)
+            for c in del_bar:
+                try:
+                    service.calendars().delete(calendarId=c['id']).execute()
+                    if quota: quota.use(1)
+                    time.sleep(0.2)
+                except Exception as e:
+                    err(f"Failed to delete {c.get('summary')}: {e}")
+            # Clear DB entries for those calendars
+            with engine.begin() as conn:
+                conn.execute(events_tbl.delete().where(events_tbl.c.calendar_summary.in_(desired)))
+                conn.execute(calendars_tbl.delete().where(calendars_tbl.c.summary.in_(desired)))
+            ok(f"Deleted {len(existing)} calendars")
+        else:
+            info("No matching calendars to delete")
+
+    course_bar = make_tqdm(courses, desc="Courses", unit="course")
+    for idx, course in enumerate(course_bar, 1):
         print("\n" + "─"*40)
-        info(f"[{idx}/{len(missing)}] Syncing: {course}")
-        
+        info(f"[{idx}/{len(courses)}] Syncing: {course}")
         try:
-            upload_single_course(service, course, by_course[course], dry_run=False)
+            sync_course_with_db(service, course, by_course[course], engine, calendars_tbl, events_tbl, quota)
         except RuntimeError as e:
             err(f"Sync failed for {course}: {e}")
-            if idx < len(missing):
-                warn(f"Waiting {pause}s before next course...")
-                time.sleep(pause)
+            if idx < len(courses):
+                warn(f"Waiting {args.pause}s before next course...")
+                time.sleep(args.pause)
         except Exception as e:
             err(f"Unexpected error: {e}")
-        
-        # Always pause between calendar creates to be safe with quota
-        if idx < len(missing):
-            info(f"Pausing {pause}s...")
-            time.sleep(pause)
-    
+
+        if tqdm and isinstance(course_bar, tqdm):
+            course_bar.set_postfix({
+                'quota_left': quota.remaining if quota else 'n/a',
+                'eta': f"{course_bar.format_dict.get('remaining', 0):.0f}s" if course_bar.format_dict else 'n/a'
+            })
+
+        if idx < len(courses):
+            info(f"Pausing {args.pause}s...")
+            time.sleep(args.pause)
+
     ok("Sync run complete")
+
+def cmd_reset_db(args):
+    header("RESET LOCAL SYNC DB")
+    engine, calendars_tbl, events_tbl = ensure_db()
+    if not engine:
+        return
+    with engine.begin() as conn:
+        conn.execute(events_tbl.delete())
+        conn.execute(calendars_tbl.delete())
+    ok("Local sync database cleared")
 
 
 def cmd_extract(args):
@@ -535,15 +988,31 @@ def main():
     p_sync = sub.add_parser('sync')
     p_sync.add_argument('--csv', default=DEFAULT_CSV)
     p_sync.add_argument('--pause', type=int, default=300, help='Seconds to wait between calendars')
+    p_sync.add_argument('--quota', type=int, default=None, help='Remaining quota to display in progress bars')
+    p_sync.add_argument('--delete-existing', action='store_true', help='Delete matching calendars before syncing')
     
     # Delete
     p_del = sub.add_parser('delete')
     p_del.add_argument('pattern')
     p_del.add_argument('--yes', action='store_true')
+
+    # Prune
+    p_prune = sub.add_parser('prune')
+    p_prune.add_argument('--yes', action='store_true')
+
+    # Dedupe
+    p_ded = sub.add_parser('dedupe')
+    p_ded.add_argument('--pattern', default=None, help='Regex to match calendar names')
+    p_ded.add_argument('--time-min', default=None, help='ISO datetime (e.g., 2026-01-01T00:00:00+01:00)')
+    p_ded.add_argument('--time-max', default=None, help='ISO datetime (e.g., 2027-01-01T00:00:00+01:00)')
+    p_ded.add_argument('--dry-run', action='store_true', help='Show duplicates without deleting')
     
     # Extract
     p_ext = sub.add_parser('extract')
     p_ext.add_argument('--pdf', default=DEFAULT_PDF)
+
+    # Reset DB
+    sub.add_parser('reset-db')
     
     args = parser.parse_args()
 
@@ -556,7 +1025,10 @@ def main():
     elif args.cmd == 'upload': cmd_upload(args)
     elif args.cmd == 'sync': cmd_sync(args)
     elif args.cmd == 'delete': cmd_delete(args)
+    elif args.cmd == 'prune': cmd_prune(args)
+    elif args.cmd == 'dedupe': cmd_dedupe(args)
     elif args.cmd == 'extract': cmd_extract(args)
+    elif args.cmd == 'reset-db': cmd_reset_db(args)
     else:
         parser.print_help()
 

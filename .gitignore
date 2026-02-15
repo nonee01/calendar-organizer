@@ -12,6 +12,12 @@ upload_*.ics
 logs/
 *.log
 
+# Backup files
+*.bak
+
+# Google Cloud SDK
+google-cloud-sdk/
+
 # Credentials
 credentials.json
 token.json
