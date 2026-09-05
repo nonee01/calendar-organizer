@@ -4,22 +4,22 @@ Enhanced Python tool for managing and organizing Sec6 calendar CSV files with co
 
 ## Features
 
-✨ **Color Management**
+**Color Management**
 - Automatically assigns Google Calendar colors to courses
 - Supports 11 distinct colors for better visual organization
 - Handles common typos and accent variations
 
-📊 **Statistics & Reporting**
+**Statistics & Reporting**
 - Shows event distribution by color, week, and course
 - Displays date ranges and event counts
 - Visual bar charts in terminal
 
-✅ **Validation**
+**Validation**
 - Validates date and time formats
 - Checks for expected week ranges (S14-S26)
 - Reports issues with row numbers for easy fixing
 
-🔧 **File Operations**
+**File Operations**
 - Automatic backup of existing files
 - Sort by color and date
 - Split into separate files by color
